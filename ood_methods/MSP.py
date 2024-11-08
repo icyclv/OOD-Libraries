@@ -6,22 +6,22 @@ import torch
 
 class MSP:
 
-    def __init__(self, model, device):
+    def __init__(self, model, args,device):
         self.model = model
         self.device = device
 
+    @ torch.no_grad()
     def eval(self, data_loader):
         self.model.eval()
         result = []
         
-        with torch.no_grad():
-            for (images, _) in tqdm(data_loader):
-                images = images.to(self.device)
-                output = self.model(images)
+        for (images, _) in tqdm(data_loader):
+            images = images.to(self.device)
+            output = self.model(images)
 
-                smax = (F.softmax(output, dim=1)).data.cpu().numpy()
-                output = np.max(smax, axis=1)
+            smax = (F.softmax(output, dim=1)).data.cpu().numpy()
+            output = np.max(smax, axis=1)
 
-                result.append(output)
+            result.append(output)
 
         return np.concatenate(result)

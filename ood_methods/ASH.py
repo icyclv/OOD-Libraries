@@ -1,13 +1,14 @@
 import torch
 import numpy as np
 from tqdm import tqdm
-
+from utils.linear_mapping import get_linear_layer_mapping
 
 class ASH:
 
-    def __init__(self, model, device):
+    def __init__(self, model, args,device):
         self.model = model
         self.device = device
+        self.linear = get_linear_layer_mapping(args.model, args.ind_dataset, model)
 
         '''
         Special Parameters:
@@ -15,28 +16,27 @@ class ASH:
             p--Pruning Percentage
         '''
         self.T = 1
-        self.p = 90
+        if args.ind_dataset in ['cifar10']:
+            self.p = 95
+        else:
+            self.p = 90
 
+    @ torch.no_grad()
     def eval(self, data_loader):
         self.model.eval()
         result = []
 
-        with torch.no_grad():
-            for (images, _) in tqdm(data_loader):
-                images = images.to(self.device)
-                _, feature = self.model.feature(images)
-                
+      
+        for (images, _) in tqdm(data_loader):
+            images = images.to(self.device)
+            _, feature = self.model.get_feature(images)
+            
+            output = ash_s_2d(feature, self.p)
 
-                # Three pruning method: ash_p, ash_b, ash_s
-                # output = ash_p(feature, self.p)
-                # output = ash_b(feature, self.p)
-                output = ash_s(feature, self.p)
+            output = self.linear(output)
+            output = self.T * torch.logsumexp(output / self.T, dim=1).data.cpu().numpy()
 
-                output = output.view(output.size(0), -1)
-                output = self.model.classifier(output)
-                output = self.T * torch.logsumexp(output / self.T, dim=1).data.cpu().numpy()
-
-                result.append(output)
+            result.append(output)
 
         return np.concatenate(result)
 
@@ -90,6 +90,28 @@ def ash_s(x, percentile):
 
     scale = s1 / s2
     x = x * torch.exp(scale[:, None, None, None])
+
+    return x
+
+def ash_s_2d(x, percentile=90):
+    assert x.dim() == 2
+    assert 0 <= percentile <= 100
+    b, c = x.shape
+
+    # calculate the sum of the input per sample
+    s1 = x.sum(dim=1)
+    n = x.shape[1]
+    k = n - int(np.round(n * percentile / 100.0))
+    t = x.view((b, c))
+    v, i = torch.topk(t, k, dim=1)
+    t.zero_().scatter_(dim=1, index=i, src=v)
+
+    # calculate new sum of the input per sample after pruning
+    s2 = x.sum(dim=1)
+
+    # apply sharpening
+    scale = s1 / s2
+    x = x * torch.exp(scale[:, None])
 
     return x
 

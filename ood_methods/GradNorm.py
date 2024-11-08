@@ -6,16 +6,17 @@ from tqdm import tqdm
 
 class GradNorm:
 
-    def __init__(self, model, device):
+    def __init__(self, model, args,device):
         self.model = model
         self.device = device
+        self.num_classes = args.num_classes
         '''
         Special Parameters:
             T--Temperature
         '''
         self.T = 1
 
-    def eval(self, data_loader, num_classes):
+    def eval(self, data_loader):
         self.model.eval()
         result = []
         logsoftmax = torch.nn.LogSoftmax(dim=-1).cuda()
@@ -25,7 +26,7 @@ class GradNorm:
 
             self.model.zero_grad()
             outputs = self.model(images)
-            targets = torch.ones((images.shape[0], num_classes)).to(self.device)
+            targets = torch.ones((images.shape[0], self.num_classes)).to(self.device)
             outputs = outputs / self.T
 
             loss = torch.mean(torch.sum(-targets * logsoftmax(outputs), dim=-1))

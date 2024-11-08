@@ -1,5 +1,8 @@
-data
-nohup.out
-checkpoints
-result
-ood_methods/Distil.py
+__pycache__/
+*.py[cod]
+*$py.class
+**/__pycache__/
+**/__pycache__/*
+cache/*
+data/*
+result/*

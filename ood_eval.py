@@ -4,54 +4,62 @@ import torch.nn as nn
 import argparse
 import os
 import numpy as np
-# import wandb
-
+import pickle
 from utils.utils import fix_random_seed
 from utils.dataset import get_dataset
 from utils.models import get_model
 from utils.metrics import cal_metric
-
-
+from torch.utils.data import DataLoader
+from utils.get_stat import get_features
 def get_eval_options():
     parser = argparse.ArgumentParser()
 
     parser.add_argument("--ind_dataset", type=str, default="ImageNet")
-    parser.add_argument("--ood_dataset", type=str, default="Textures")    
-    parser.add_argument("--model", type=str, default="ConvNext")
-    parser.add_argument("--gpu", type=int, default=0)
+    parser.add_argument("--ood_dataset",type=str,nargs='+', default=["iNat", "SUN","Places","Textures", "openimage_o","imagenet_o"])    
+    parser.add_argument("--model", type=str, default="resnet")
+    parser.add_argument("--gpu", type=int, default=1)
     parser.add_argument('--num_classes', type=int, default=1000)
-
     parser.add_argument("--random_seed", type=int, default=0)
-    parser.add_argument("--bs", type=int, default=512)
-    parser.add_argument("--OOD_method", type=str, default="OptFS")
-
+    parser.add_argument("--bs", type=int, default=32)
+    parser.add_argument("--OOD_method", type=str, default="CADRef")
+    parser.add_argument("--use_feature_cache", type=bool, default=True, help="use feature cache")
+    parser.add_argument("--use_score_cache", type=bool, default=True, help="use score cache")
+    parser.add_argument("--cache_dir", type=str, default="cache")
+    parser.add_argument("--result_dir", type=str, default="result")
+    parser.add_argument("--num_workers", type=int, default=24)
+    parser.add_argument("--logit_method", type=str, default="Energy",choices=["Energy","MSP","MaxLogit","GEN"],help="logit method for CADRef")
     args = parser.parse_args()
     return args
 
 if __name__ == '__main__':
-    start_time = time.time()
     args = get_eval_options()
     fix_random_seed(args.random_seed)
     device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
+    
 
-    # wandb.init(
-    #     project="ood-record",
-    #     config={
-    #         "architecture": args.model,
-    #         "ind_dataset": args.ind_dataset,
-    #         "ood_dataset": args.ood_dataset,
-    #         "method": args.OOD_method,
-    #     }
-    # )
 
-    _, ind_dataset = get_dataset(args.ind_dataset)
-    _, ood_dataset = get_dataset(args.ood_dataset)
+    for dir_path in [
+        args.cache_dir,
+        args.result_dir,
+        os.path.join(args.cache_dir, args.model),
+        os.path.join(args.result_dir, args.model),
+        os.path.join(args.cache_dir, args.model, args.ind_dataset),
+        os.path.join(args.result_dir, args.model, args.ind_dataset)
+    ]:
+        os.makedirs(dir_path, exist_ok=True)
 
     if args.OOD_method in ['GradNorm']:
         args.bs = 1
 
-    ind_loader = torch.utils.data.DataLoader(dataset=ind_dataset, batch_size=args.bs, pin_memory=True, num_workers=8, shuffle=False)
-    ood_loader = torch.utils.data.DataLoader(dataset=ood_dataset, batch_size=args.bs, pin_memory=True, num_workers=8, shuffle=False)
+    if args.ind_dataset == "ImageNet":
+        args.num_classes = 1000
+    elif args.ind_dataset == "cifar10":
+        args.num_classes = 10
+    elif args.ind_dataset == "cifar100":
+        args.num_classes = 100
+    print(args)
+    
+
 
     model = get_model(args).to(device)
     model.eval()
@@ -60,195 +68,189 @@ if __name__ == '__main__':
 
     if args.OOD_method == "MSP":
         from ood_methods.MSP import MSP
-        msp = MSP(model, device)
+        evaluator = MSP(model, args, device)
 
-        # step 1: get msp score
-        ind_scores = msp.eval(ind_loader)
-        ood_scores = msp.eval(ood_loader)
 
     elif args.OOD_method == "ODIN":
         from ood_methods.ODIN import ODIN
-        odin = ODIN(model, device)
-
-        # step 1: get odin score
-        ind_scores = odin.eval(ind_loader)
-        ood_scores = odin.eval(ood_loader)
+        evaluator = ODIN(model, args, device)
 
     elif args.OOD_method == "Energy":
         from ood_methods.Energy import Energy
-        energy = Energy(model, device)
-
-        # step 1: get energy score
-        ind_scores = energy.eval(ind_loader)
-        ood_scores = energy.eval(ood_loader)
+        evaluator = Energy(model, args, device)
 
     elif args.OOD_method == "GEN":
         from ood_methods.GEN import GEN
-        gen = GEN(model, device)
-
-        # step 1: get gen score
-        ind_scores = gen.eval(ind_loader)
-        ood_scores = gen.eval(ood_loader)
-
-    elif args.OOD_method == "Mahalanobis":
-        from ood_methods.Mahalanobis import mahalanobis_eval
-        ind_scores = mahalanobis_eval(model, ind_loader)
-        ood_scores = mahalanobis_eval(model, ood_loader)
+        evaluator = GEN(model, args, device)
 
     elif args.OOD_method == "ReAct":
         from ood_methods.ReAct import ReAct
-        react = ReAct(model, device)
+        evaluator = ReAct(model, args, device)
 
-        # step 1: get activation threshold
-        # load training threshold
-        file_threshold = "result/threshold/{}/{}/train_threshold.csv".format(args.ind_dataset, args.model)
-
-        if os.path.exists(file_threshold):
-            threshold = torch.from_numpy(np.genfromtxt(file_threshold)).to(device)
-            print("load train threshold")
+        threshold_file_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, "ReAct_threshold.pkl")
+        if os.path.exists(threshold_file_path) and args.use_feature_cache:
+            with open(threshold_file_path, "rb") as f:
+                threshold = pickle.load(f)
         else:
-            train_data, _ = get_dataset(args.ind_dataset)
-            train_loader = torch.utils.data.DataLoader(train_data, batch_size=1024, pin_memory=True, shuffle=False, num_workers=8)
-            threshold = react.get_threshold(train_loader)
-            np.savetxt(file_threshold, np.array([threshold]))
-            print("save train threshold")
+            train_data, _ = get_dataset(args.ind_dataset,args)
+            train_loader = DataLoader(dataset=train_data, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers, shuffle=False)
+            features, logits = get_features(model, train_loader, args, device)
+            threshold = evaluator.get_threshold(features)
+            with open(threshold_file_path, "wb") as f:
+                pickle.dump(threshold, f)
+        
+        evaluator.set_state(threshold)
 
-        # step 2: get react score
-        ind_scores = react.eval(ind_loader, threshold)
-        ood_scores = react.eval(ood_loader, threshold)
-    
+
     elif args.OOD_method == "DICE":
         from ood_methods.DICE import DICE
-        dice = DICE(model, device)
+        evaluator = DICE(model, args, device)
 
-        # step 1: get masking matrix
-        train_data, _ = get_dataset(args.ind_dataset)
-        train_loader = torch.utils.data.DataLoader(train_data, batch_size=512, pin_memory=True, shuffle=False, num_workers=8, drop_last=True)
-        dice.get_mask(train_loader, args.num_classes)
-
-        # step 2: get DICE score
-        ind_scores = dice.eval(ind_loader)
-        ood_scores = dice.eval(ood_loader)
-
+        mask_file_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, "DICE_mask.pkl")
+        if os.path.exists(mask_file_path) and args.use_feature_cache:
+            with open(mask_file_path, "rb") as f:
+                mask = pickle.load(f)
+        else:
+            train_data, _ = get_dataset(args.ind_dataset,args)
+            train_loader = DataLoader(dataset=train_data, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers, shuffle=False)
+            features, logits = get_features(model, train_loader, args, device)
+            mask = evaluator.get_mask(features)
+            with open(mask_file_path, "wb") as f:
+                pickle.dump(mask, f)
+        
+        evaluator.set_state(mask)
     elif args.OOD_method == "GradNorm":
         from ood_methods.GradNorm import GradNorm
-        gradnorm = GradNorm(model, device)
+        evaluator = GradNorm(model, args, device)
 
-        # step 1: get gradnorm score
-        ind_scores = gradnorm.eval(ind_loader, args.num_classes)
-        ood_scores = gradnorm.eval(ood_loader, args.num_classes)
+    elif args.OOD_method == "MaxLogit":
+        from ood_methods.MaxLogit import MaxLogit
+        evaluator = MaxLogit(model, args, device)
 
     elif args.OOD_method == "ASH":
         from ood_methods.ASH import ASH
-        ash = ASH(model, device)
-
-        # step 1: get ash score
-        ind_scores = ash.eval(ind_loader)
-        ood_scores = ash.eval(ood_loader)
+        evaluator = ASH(model,args, device)
 
     elif args.OOD_method == "OptFS":
         from ood_methods.OptFS import OptFS
-        optfs = OptFS(model, device)
+        evaluator = OptFS(model, args, device)
         
-        # load training features
-        stored = "result/features/common/{}/{}/train_info.npz".format(args.ind_dataset, args.model)
-        
-        if os.path.isfile(stored):
-            train_info = np.load(stored)
-            features = train_info['feature']
-            preds = train_info['pred']
-            print("load train features")
-
+        shaping_parameter_file_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, "OptFS_shaping_parameter.pkl")
+        if os.path.exists(shaping_parameter_file_path) and args.use_feature_cache:
+            with open(shaping_parameter_file_path, "rb") as f:
+                theta, left_boundary, width = pickle.load(f)
         else:
-            train_data, _ = get_dataset(args.ind_dataset)
-            train_loader = torch.utils.data.DataLoader(train_data, batch_size=512, pin_memory=True, shuffle=False, num_workers=8)
-            features, preds = optfs.get_features(train_loader, args.num_classes)
+            train_data, _ = get_dataset(args.ind_dataset,args)
+            train_loader = DataLoader(dataset=train_data, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers, shuffle=False)
+            features, logits = get_features(model, train_loader, args, device)
+            theta, left_boundary, width = evaluator.get_optimal_shaping(features, logits)
+            with open(shaping_parameter_file_path, "wb") as f:
+                pickle.dump((theta, left_boundary, width), f)
+        
+        evaluator.set_state(theta, left_boundary, width)
 
-            np.savez(stored, feature=features, pred=preds)
-            print("save train features")
+    elif args.OOD_method == "VIM":
+        from ood_methods.VIM import VIM
+        evaluator = VIM(model, args, device)
+
+        NS_file_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, "VIM_NS.pkl")
+        if os.path.exists(NS_file_path) and args.use_feature_cache:
+            with open(NS_file_path, "rb") as f:
+                NS, alpha,u = pickle.load(f)
+        else:
+            train_data, _ = get_dataset(args.ind_dataset,args)
+            train_loader = DataLoader(dataset=train_data, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers, shuffle=False)
+            features, logits = get_features(model, train_loader, args, device)
+            NS, alpha,u = evaluator.get_ns(features)
+            with open(NS_file_path, "wb") as f:
+                pickle.dump((NS, alpha,u), f)
+        
+        evaluator.set_state(NS, alpha,u)
+    elif args.OOD_method == "Residual":
+        from ood_methods.VIM import VIM
+        evaluator = VIM(model, args, device, mode="Residual")
+
+        NS_file_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, "VIM_NS.pkl")
+        if os.path.exists(NS_file_path) and args.use_feature_cache:
+            with open(NS_file_path, "rb") as f:
+                NS = pickle.load(f)
+        else:
+            train_data, _ = get_dataset(args.ind_dataset,args)
+            train_loader = DataLoader(dataset=train_data, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers, shuffle=False)
+            features, logits = get_features(model, train_loader, args, device)
+            NS = evaluator.get_NS(features)
+            with open(NS_file_path, "wb") as f:
+                pickle.dump(NS, f)
+        
+        evaluator.set_state(NS)
     
-        theta = optfs.get_optimal_shaping(features, preds)
-
-        ind_scores = optfs.eval(ind_loader, theta)
-        ood_scores = optfs.eval(ood_loader, theta)
-
-
-    elif args.OOD_method == "DIST":
-        from ood_methods.DIST import DIST
-        import pickle
-        dist = DIST(model, device)
-
-        # load training features
-        stored = "result/features/{}/{}/train_info.npz".format(args.ind_dataset, args.model)
-
-        if os.path.isfile(stored):
-            train_info = np.load(stored)
-            features = train_info['feature']
-            print("load train features")
+    elif args.OOD_method == "CARef":
+        from ood_methods.CARef import CARef
+        evaluator = CARef(model, args, device)
+        caref_file_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, "CARef_feature_mean.pkl")
+        if os.path.exists(caref_file_path) and args.use_feature_cache:
+            with open(caref_file_path, "rb") as f:
+                feature_mean = pickle.load(f)
         else:
-            train_data, _ = get_dataset(args.ind_dataset)
-            train_loader = torch.utils.data.DataLoader(train_data, batch_size=1024, pin_memory=True, shuffle=False, num_workers=8)
-            features = dist.get_features(train_loader, args.num_classes)
-            # np.savez(stored, feature=features, pred=preds)
-            # print("save train features")
+            train_data, _ = get_dataset(args.ind_dataset,args)
+            train_loader = DataLoader(dataset=train_data, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers, shuffle=False)
+            features, logits = get_features(model, train_loader, args, device)
+            feature_mean = evaluator.get_mean_feature(features)
+            with open(caref_file_path, "wb") as f:
+                pickle.dump(feature_mean, f)
         
-        theta = dist.get_optimal_shaping(features)
-        mean_feature = DIST.get_stats(features)
-
-        ind_scores = dist.eval(ind_loader, mean_feature)
-        ood_scores = dist.eval(ood_loader, mean_feature)
-
-
-    elif args.OOD_method == "Distil":
-        from ood_methods.Distil import Distil
-
-        distil = Distil(model, device)
-
-        # load training logits
-        file_logits = "result/logits/{}_{}_in.csv".format(args.ind_dataset, args.model)
-
-        if os.path.exists(file_logits):
-            logits = torch.from_numpy(np.genfromtxt(file_logits))
-            print("load train logits")
+        evaluator.set_state(feature_mean)
+    elif args.OOD_method == "CADRef":
+        from ood_methods.CADRef import CADRef
+        evaluator = CADRef(model, args, device)
+        cadref_file_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, "CADRef_"+args.logit_method+".pkl")
+        if os.path.exists(cadref_file_path) and args.use_feature_cache:
+            with open(cadref_file_path, "rb") as f:
+                train_mean, global_mean_logit_score = pickle.load(f)
         else:
-            train_data, _ = get_dataset(args.ind_dataset)
-            train_loader = torch.utils.data.DataLoader(train_data, batch_size=1024, pin_memory=True, shuffle=False, num_workers=8)
-            logits = torch.from_numpy(distil.get_logits(train_loader, args.num_classes))
-            np.savetxt(file_logits, logits)
-                              
-        ind_scores = distil.eval(ind_loader, logits)
-        ood_scores = distil.eval(ood_loader, logits)
+            train_data, _ = get_dataset(args.ind_dataset,args)
+            train_loader = DataLoader(dataset=train_data, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers, shuffle=False)
+            features, logits = get_features(model, train_loader, args, device)
+            train_mean, global_mean_logit_score = evaluator.get_state(features, logits)
+            with open(cadref_file_path, "wb") as f:
+                pickle.dump((train_mean, global_mean_logit_score), f)
         
-        # file_path_in = "result/{}_{}_{}_in.csv".format(args.OOD_method, args.ind_dataset, args.model)
-        # if os.path.exists(file_path_in):
-        #    ind_scores = np.genfromtxt(file_path_in, delimiter=' ')
-        #    print("load ind-scores")
-        # else:
-        #    ind_scores = distil.eval(ind_loader, logits)
-        #    np.savetxt(file_path_in, ind_scores, delimiter=' ')
+        evaluator.set_state(train_mean, global_mean_logit_score)
 
-        # file_path_out = "result/{}_{}_{}_{}_out.csv".format(args.OOD_method, args.ind_dataset, args.ood_dataset, args.model)
-        # if os.path.exists(file_path_out):
-        #     ood_scores = np.genfromtxt(file_path_out, delimiter=' ')
-        #     print("load ood-scores")
-        # else:
-        #     ood_scores = distil.eval(ood_loader, logits)
-        #     np.savetxt(file_path_out, ood_scores, delimiter=' ')
-
-        # ind_scores = distil_eval(model, ind_loader, train_logits, args, device)
-        # ood_scores = distil_eval(model, ood_loader, train_logits, args, device)
-
+    ind_score_cache_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, args.OOD_method+"_ind_scores.pkl")
+    if args.OOD_method == "CADRef":
+        ind_score_cache_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, args.OOD_method+"_"+args.logit_method+"_ind_scores.pkl")
+    if os.path.exists(ind_score_cache_path) and args.use_score_cache:
+        with open(ind_score_cache_path, "rb") as f:
+            ind_scores = pickle.load(f)
+    else:
+        _, ind_data = get_dataset(args.ind_dataset,args)
+        ind_loader = DataLoader(dataset=ind_data, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers, shuffle=False)
+        ind_scores = evaluator.eval(ind_loader)
+        with open(ind_score_cache_path, "wb") as f:
+            pickle.dump(ind_scores, f)
     ind_labels = np.ones(ind_scores.shape[0])
-    ood_labels = np.zeros(ood_scores.shape[0])
+    for ood_dataset in args.ood_dataset:
+        ood_score_cache_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, args.OOD_method+"_"+ood_dataset+"_scores.pkl")
+        if args.OOD_method == "CADRef":
+            ood_score_cache_path = os.path.join(args.cache_dir, args.model, args.ind_dataset, args.OOD_method+"_"+args.logit_method+"_"+ood_dataset+"_scores.pkl")
+        if os.path.exists(ood_score_cache_path) and args.use_score_cache:
+            with open(ood_score_cache_path, "rb") as f:
+                ood_scores = pickle.load(f)
+        else:
+            _, ood_data = get_dataset(ood_dataset,args)
+            ood_loader = DataLoader(dataset=ood_data, batch_size=args.bs, pin_memory=True, num_workers=args.num_workers, shuffle=False)
+            ood_scores = evaluator.eval(ood_loader)
+            with open(ood_score_cache_path, "wb") as f:
+                pickle.dump(ood_scores, f)
+        ood_labels = np.zeros(ood_scores.shape[0])
+        scores = np.concatenate([ind_scores, ood_scores])
+        labels = np.concatenate([ind_labels, ood_labels])
+        auroc, aupr, fpr = cal_metric(labels, scores)
+        auroc = round(auroc*100, 4)
+        fpr = round(fpr*100, 4)
+        print("{:10} {:10} {:10} {:10}".format(args.OOD_method, ood_dataset, auroc, fpr))
+        with open(os.path.join(args.result_dir, args.model,args.ind_dataset, args.OOD_method+".txt"), "a") as f:
+            f.write("{:20} {:10} {:10} {:10}\n".format(time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()), ood_dataset, auroc, fpr))
+      
 
-    labels = np.concatenate([ind_labels, ood_labels])
-    scores = np.concatenate([ind_scores, ood_scores])
-
-    auroc, aupr, fpr = cal_metric(labels, scores)
-
-    # wandb.log({"AUROC": auroc, "FPR": fpr})
-    print("{:10} {}".format("AUROC:", auroc))
-    print("{:10} {}".format("FPR:", fpr))
-
-    finish_time = time.time()
-    print(finish_time - start_time)
